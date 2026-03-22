@@ -1,95 +1,313 @@
 import sys
-import os
-from antlr4 import *
-from SimpleSQLLexer import SimpleSQLLexer
-from SimpleSQLParser import SimpleSQLParser
-from SimpleSQLVisitor import SimpleSQLVisitor
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QPushButton, QTableWidget, 
                              QTableWidgetItem, QLabel, QMessageBox)
 from PyQt5.QtCore import Qt
 
-class SQLQueryVisitor(SimpleSQLVisitor):
-    """Visitor para executar consultas SQL"""
+# Constantes
+DATA_FILE = 'empregados.txt'
+COLUMNS = ['nome', 'cpf', 'matricula', 'sexo', 'salario', 'idade']
+
+# Tokens
+class Token:
+    def __init__(self, type_, value, line, column):
+        self.type = type_
+        self.value = value
+        self.line = line
+        self.column = column
     
-    def __init__(self, data_file):
-        self.data_file = data_file
-        self.columns = ['nome', 'cpf', 'matricula', 'sexo', 'salario', 'idade']
-        self.data = self.load_data()
-        
-    def load_data(self):
-        """Carrega dados do arquivo"""
-        data = []
-        try:
-            with open(self.data_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.strip():
-                        fields = line.strip().split(';')
-                        if len(fields) == 6:
-                            # Converte tipos
-                            fields[4] = float(fields[4])  # salario
-                            fields[5] = int(fields[5])    # idade
-                            data.append(dict(zip(self.columns, fields)))
-            return data
-        except FileNotFoundError:
-            raise Exception(f"Arquivo {self.data_file} não encontrado")
+    def __repr__(self):
+        return f"Token({self.type}, {self.value})"
+
+class Lexer:
+    """Lexer manual para a gramática SQL simplificada"""
     
-    def visitSelect_statement(self, ctx:SimpleSQLParser.Select_statementContext):
-        """Processa SELECT statement"""
-        # Obtém colunas selecionadas
-        select_cols_ctx = ctx.select_columns()
+    def __init__(self, text):
+        self.text = text
+        self.pos = 0
+        self.line = 1
+        self.column = 1
+        self.tokens = []
         
-        if select_cols_ctx.getText() == '*':
-            selected_columns = self.columns
+    def tokenize(self):
+        """Converte o texto em uma lista de tokens"""
+        while self.pos < len(self.text):
+            char = self.text[self.pos]
+            
+            # Pular whitespace
+            if char in ' \t\r\n':
+                if char == '\n':
+                    self.line += 1
+                    self.column = 1
+                else:
+                    self.column += 1
+                self.pos += 1
+                continue
+            
+            # Palavras-chave e identificadores
+            if char.isalpha() or char == '_':
+                self._read_identifier()
+                continue
+            
+            # Strings
+            if char == "'":
+                self._read_string()
+                continue
+            
+            # Números
+            if char.isdigit():
+                self._read_number()
+                continue
+            
+            # Operadores e outros símbolos
+            if char in '=<>!':
+                self._read_operator()
+                continue
+            
+            if char == '*':
+                self.tokens.append(Token('STAR', '*', self.line, self.column))
+                self.pos += 1
+                self.column += 1
+                continue
+            
+            if char == ',':
+                self.tokens.append(Token('COMMA', ',', self.line, self.column))
+                self.pos += 1
+                self.column += 1
+                continue
+            
+            raise Exception(f"Caractere inválido '{char}' na linha {self.line}, coluna {self.column}")
+        
+        self.tokens.append(Token('EOF', None, self.line, self.column))
+        return self.tokens
+    
+    def _read_identifier(self):
+        """Lê um identificador ou palavra-chave"""
+        start = self.pos
+        start_column = self.column
+        
+        while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == '_'):
+            self.pos += 1
+            self.column += 1
+        
+        value = self.text[start:self.pos]
+        value_upper = value.upper()
+        
+        # Verifica se é palavra-chave
+        if value_upper == 'SELECT':
+            self.tokens.append(Token('SELECT', value, self.line, start_column))
+        elif value_upper == 'FROM':
+            self.tokens.append(Token('FROM', value, self.line, start_column))
+        elif value_upper == 'WHERE':
+            self.tokens.append(Token('WHERE', value, self.line, start_column))
         else:
-            selected_columns = []
-            for col in select_cols_ctx.column_list().column_name():
-                col_name = col.getText().lower()
-                if col_name not in self.columns:
-                    raise Exception(f"Coluna '{col_name}' não existe. Colunas disponíveis: {', '.join(self.columns)}")
-                selected_columns.append(col_name)
-        
-        # Filtra dados com WHERE se existir
-        filtered_data = self.data
-        if ctx.where_condition():
-            filtered_data = self.visitWhere_condition(ctx.where_condition())
-        
-        # Seleciona colunas
-        result_data = []
-        for row in filtered_data:
-            result_row = [row[col] for col in selected_columns]
-            result_data.append(result_row)
-        
-        return selected_columns, result_data
+            self.tokens.append(Token('IDENTIFIER', value, self.line, start_column))
     
-    def visitWhere_condition(self, ctx:SimpleSQLParser.Where_conditionContext):
-        """Processa WHERE condition"""
-        return self.visitExpression(ctx.expression())
-    
-    def visitExpression(self, ctx:SimpleSQLParser.ExpressionContext):
-        """Processa expressão WHERE"""
-        column_name = ctx.column_name().getText().lower()
-        operator = ctx.comparison_operator().getText()
-        value_ctx = ctx.value()
+    def _read_string(self):
+        """Lê uma string entre aspas simples"""
+        start = self.pos
+        start_column = self.column
+        self.pos += 1  # Pula a aspa inicial
+        self.column += 1
         
-        # Verifica se a coluna existe
-        if column_name not in self.columns:
-            raise Exception(f"Coluna '{column_name}' não existe na cláusula WHERE")
-        
-        # Obtém o valor
-        if value_ctx.STRING():
-            value = value_ctx.getText()[1:-1]  # Remove aspas
-        else:  # NUMBER
-            value_text = value_ctx.getText()
-            if '.' in value_text:
-                value = float(value_text)
+        while self.pos < len(self.text) and self.text[self.pos] != "'":
+            if self.text[self.pos] == '\n':
+                self.line += 1
+                self.column = 1
             else:
-                value = int(value_text)
+                self.column += 1
+            self.pos += 1
         
-        # Filtra os dados
+        if self.pos >= len(self.text):
+            raise Exception(f"String não fechada na linha {self.line}")
+        
+        self.pos += 1  # Pula a aspa final
+        self.column += 1
+        value = self.text[start:self.pos]
+        self.tokens.append(Token('STRING', value, self.line, start_column))
+    
+    def _read_number(self):
+        """Lê um número"""
+        start = self.pos
+        start_column = self.column
+        has_dot = False
+        
+        while self.pos < len(self.text) and (self.text[self.pos].isdigit() or self.text[self.pos] == '.'):
+            if self.text[self.pos] == '.':
+                if has_dot:
+                    break
+                has_dot = True
+            self.pos += 1
+            self.column += 1
+        
+        value = self.text[start:self.pos]
+        self.tokens.append(Token('NUMBER', value, self.line, start_column))
+    
+    def _read_operator(self):
+        """Lê um operador de comparação"""
+        start = self.pos
+        start_column = self.column
+        char = self.text[self.pos]
+        
+        if self.pos + 1 < len(self.text) and self.text[self.pos + 1] == '=':
+            operator = char + '='
+            self.pos += 2
+            self.column += 2
+        else:
+            operator = char
+            self.pos += 1
+            self.column += 1
+        
+        if operator in ['=', '>', '<', '>=', '<=', '!=']:
+            self.tokens.append(Token('OPERATOR', operator, self.line, start_column))
+        else:
+            raise Exception(f"Operador inválido '{operator}' na linha {self.line}")
+
+class Parser:
+    """Parser manual para a gramática SQL simplificada"""
+    
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+    
+    def parse(self):
+        """Parseia a entrada completa"""
+        result = self.parse_select_statement()
+        self._match('EOF')
+        return result
+    
+    def parse_select_statement(self):
+        """Parseia SELECT statement"""
+        self._match('SELECT')
+        columns = self.parse_select_columns()
+        self._match('FROM')
+        table = self._match('IDENTIFIER')
+        
+        where_condition = None
+        if self._peek() == 'WHERE':
+            self._match('WHERE')
+            where_condition = self.parse_where_condition()
+        
+        return {
+            'type': 'SELECT',
+            'columns': columns,
+            'table': table.value,
+            'where': where_condition
+        }
+    
+    def parse_select_columns(self):
+        """Parseia lista de colunas"""
+        if self._peek() == 'STAR':
+            self._match('STAR')
+            return '*'
+        else:
+            return self.parse_column_list()
+    
+    def parse_column_list(self):
+        """Parseia lista de colunas separadas por vírgula"""
+        columns = [self._match('IDENTIFIER').value]
+        
+        while self._peek() == 'COMMA':
+            self._match('COMMA')
+            columns.append(self._match('IDENTIFIER').value)
+        
+        return columns
+    
+    def parse_where_condition(self):
+        """Parseia condição WHERE"""
+        return self.parse_expression()
+    
+    def parse_expression(self):
+        """Parseia expressão"""
+        column = self._match('IDENTIFIER').value
+        operator = self._match('OPERATOR').value
+        value_token = self._match(['STRING', 'NUMBER'])
+        value = value_token.value
+        
+        # Remove aspas das strings
+        if value_token.type == 'STRING':
+            value = value[1:-1]
+        else:
+            # Converte número
+            if '.' in value:
+                value = float(value)
+            else:
+                value = int(value)
+        
+        return {
+            'column': column,
+            'operator': operator,
+            'value': value
+        }
+    
+    def _match(self, expected):
+        """Verifica e consome um token esperado"""
+        if isinstance(expected, list):
+            if self.pos >= len(self.tokens):
+                raise Exception(f"Fim de arquivo inesperado, esperava {expected}")
+            token = self.tokens[self.pos]
+            if token.type not in expected:
+                raise Exception(f"Esperava {expected}, encontrou {token.type} '{token.value}' na linha {token.line}")
+            self.pos += 1
+            return token
+        else:
+            if self.pos >= len(self.tokens):
+                raise Exception(f"Fim de arquivo inesperado, esperava {expected}")
+            token = self.tokens[self.pos]
+            if token.type != expected:
+                raise Exception(f"Esperava {expected}, encontrou {token.type} '{token.value}' na linha {token.line}")
+            self.pos += 1
+            return token
+    
+    def _peek(self):
+        """Olha o próximo token sem consumir"""
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos].type
+        return 'EOF'
+
+def load_data():
+    """Carrega dados do arquivo"""
+    data = []
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    fields = line.strip().split(';')
+                    if len(fields) == 6:
+                        fields[4] = float(fields[4])
+                        fields[5] = int(fields[5])
+                        data.append(dict(zip(COLUMNS, fields)))
+        return data
+    except FileNotFoundError:
+        raise Exception(f"Arquivo {DATA_FILE} não encontrado")
+
+def execute_query(parsed_query, data):
+    """Executa a consulta parseada"""
+    # Verifica se é SELECT
+    if parsed_query['type'] != 'SELECT':
+        raise Exception("Apenas consultas SELECT são suportadas")
+    
+    # Seleciona colunas
+    if parsed_query['columns'] == '*':
+        selected_columns = COLUMNS
+    else:
+        selected_columns = []
+        for col in parsed_query['columns']:
+            if col.lower() not in COLUMNS:
+                raise Exception(f"Coluna '{col}' não existe. Colunas disponíveis: {', '.join(COLUMNS)}")
+            selected_columns.append(col.lower())
+    
+    # Aplica filtro WHERE
+    filtered_data = data
+    if parsed_query['where']:
+        where = parsed_query['where']
         filtered_data = []
-        for row in self.data:
-            row_value = row[column_name]
+        
+        for row in data:
+            row_value = row[where['column'].lower()]
+            value = where['value']
+            operator = where['operator']
             
             try:
                 if operator == '=':
@@ -111,23 +329,27 @@ class SQLQueryVisitor(SimpleSQLVisitor):
                     if str(row_value).lower() != str(value).lower() if isinstance(row_value, str) else row_value != value:
                         filtered_data.append(row)
             except TypeError:
-                # Se houver erro de tipo na comparação, ignora esta linha
                 continue
-        
-        return filtered_data
+    
+    # Prepara resultados
+    result_data = []
+    for row in filtered_data:
+        result_row = [row[col] for col in selected_columns]
+        result_data.append(result_row)
+    
+    return selected_columns, result_data
 
-class SecureDB(QMainWindow):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.sql_visitor = None
+        self.data = None
         self.init_ui()
         
     def init_ui(self):
         """Inicializa a interface do usuário"""
-        self.setWindowTitle('Secure DB')
+        self.setWindowTitle('Secure DB - Consulta SQL')
         self.setGeometry(100, 100, 1200, 700)
         
-        # Aplica estilo moderno
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #1e1e2e;
@@ -199,23 +421,19 @@ class SecureDB(QMainWindow):
             }
         """)
         
-        # Widget central
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Layout principal
         main_layout = QVBoxLayout()
         main_layout.setSpacing(20)
         main_layout.setContentsMargins(20, 20, 20, 20)
         central_widget.setLayout(main_layout)
         
-        # Título
-        title_label = QLabel('🔒 Secure DB')
+        title_label = QLabel('🔒 Secure DB - Consulta SQL')
         title_label.setObjectName('title')
         title_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title_label)
         
-        # Área de consulta
         query_label = QLabel('Consulta SQL (somente leitura)')
         query_label.setStyleSheet('color: #ffffff; font-size: 14px; font-weight: bold; margin-top: 10px;')
         main_layout.addWidget(query_label)
@@ -227,11 +445,10 @@ class SecureDB(QMainWindow):
             'Exemplos:\n'
             '  SELECT * FROM empregado\n'
             '  SELECT nome, salario FROM empregado WHERE idade > 30\n'
-            '  SELECT * FROM empregado WHERE sexo = \'F\' AND salario > 5000'
+            '  SELECT * FROM empregado WHERE sexo = \'F\''
         )
         main_layout.addWidget(self.sql_input)
         
-        # Botão executar
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         
@@ -246,7 +463,6 @@ class SecureDB(QMainWindow):
         button_layout.addStretch()
         main_layout.addLayout(button_layout)
         
-        # Grid de resultados
         results_label = QLabel('Resultados da Consulta')
         results_label.setStyleSheet('color: #ffffff; font-size: 14px; font-weight: bold; margin-top: 20px;')
         main_layout.addWidget(results_label)
@@ -257,28 +473,25 @@ class SecureDB(QMainWindow):
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         main_layout.addWidget(self.result_table)
         
-        # Status bar
         self.status_label = QLabel('✅ Pronto para consultas')
         self.status_label.setObjectName('status')
         main_layout.addWidget(self.status_label)
         
-        # Carrega os dados
         self.load_database()
     
     def load_database(self):
         """Carrega o banco de dados"""
         try:
-            self.sql_visitor = SQLQueryVisitor('empregados.txt')
-            self.status_label.setText(f'✅ Banco de dados carregado - {len(self.sql_visitor.data)} registros disponíveis')
+            self.data = load_data()
+            self.status_label.setText(f'✅ Banco de dados carregado - {len(self.data)} registros disponíveis')
             self.status_label.setObjectName('status')
-            self.status_label.setStyleSheet('')
         except Exception as e:
             self.status_label.setText(f'❌ Erro ao carregar banco de dados: {str(e)}')
             self.status_label.setObjectName('error')
     
     def execute_query(self):
         """Executa a consulta SQL"""
-        if not self.sql_visitor:
+        if not self.data:
             QMessageBox.warning(self, 'Aviso', 'Banco de dados não carregado!')
             return
         
@@ -288,26 +501,19 @@ class SecureDB(QMainWindow):
             QMessageBox.warning(self, 'Aviso', 'Por favor, digite uma consulta SQL')
             return
         
-        # Verifica se é apenas SELECT
-        if not query.lower().strip().startswith('select'):
-            QMessageBox.warning(self, 'Consulta Inválida', 'Apenas consultas SELECT são permitidas neste sistema!')
-            return
-        
         try:
-            # Parsing da consulta
-            input_stream = InputStream(query)
-            lexer = SimpleSQLLexer(input_stream)
-            stream = CommonTokenStream(lexer)
-            parser = SimpleSQLParser(stream)
-            tree = parser.parse()
+            # Tokeniza e parseia
+            lexer = Lexer(query)
+            tokens = lexer.tokenize()
+            parser = Parser(tokens)
+            parsed_query = parser.parse()
             
-            # Executa a consulta
-            columns, data = self.sql_visitor.visit(tree)
+            # Executa
+            columns, data = execute_query(parsed_query, self.data)
             
             # Exibe resultados
             self.display_results(columns, data)
             
-            # Atualiza status
             self.status_label.setText(f'✅ Consulta executada com sucesso - {len(data)} registro(s) encontrado(s)')
             self.status_label.setObjectName('status')
             
@@ -320,22 +526,12 @@ class SecureDB(QMainWindow):
         """Exibe os resultados na tabela"""
         self.result_table.clear()
         
-        if not data:
-            self.result_table.setRowCount(0)
-            self.result_table.setColumnCount(len(columns))
-            self.result_table.setHorizontalHeaderLabels([col.upper() for col in columns])
-            return
-        
         self.result_table.setRowCount(len(data))
         self.result_table.setColumnCount(len(columns))
-        
-        # Configura cabeçalhos
         self.result_table.setHorizontalHeaderLabels([col.upper() for col in columns])
         
-        # Preenche dados
         for i, row in enumerate(data):
             for j, value in enumerate(row):
-                # Formata valores
                 if isinstance(value, float):
                     display_value = f'R$ {value:,.2f}'
                 elif isinstance(value, int):
@@ -344,18 +540,15 @@ class SecureDB(QMainWindow):
                     display_value = str(value)
                 
                 item = QTableWidgetItem(display_value)
-                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 
-                # Alinha números à direita
                 if isinstance(value, (int, float)):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 
                 self.result_table.setItem(i, j, item)
         
-        # Ajusta tamanho das colunas
         self.result_table.resizeColumnsToContents()
-        
-        # Ajusta altura das linhas
         self.result_table.resizeRowsToContents()
     
     def clear_query(self):
@@ -367,40 +560,11 @@ class SecureDB(QMainWindow):
         self.status_label.setText('✅ Pronto para consultas')
         self.status_label.setObjectName('status')
 
-def create_sample_file():
-    """Cria um arquivo de exemplo se não existir"""
-    sample_data = [
-        "Beatriz Costa;869.692.983-70;341733;F;8374.65;30",
-        "Pedro Santos;344.262.312-05;413147;M;13743.62;27",
-        "Carlos Silva;918.680.284-45;338638;M;8293.63;43",
-        "Rodrigo Barbosa;500.993.034-00;552363;M;6554.53;53",
-        "Débora Nascimento;990.930.821-59;732426;F;6312.33;39",
-        "Luciana Mendes;268.556.192-74;920759;F;4341.44;45",
-        "Ana Paula Souza;123.456.789-00;123456;F;9876.54;28",
-        "João Oliveira;987.654.321-00;654321;M;11234.56;35",
-        "Mariana Santos;456.789.123-00;789123;F;5432.10;31",
-        "Ricardo Alves;111.222.333-44;456789;M;15234.89;38",
-        "Fernanda Lima;555.666.777-88;987654;F;9234.67;29",
-        "Roberto Mendes;999.888.777-66;321654;M;7345.12;42"
-    ]
-    
-    try:
-        with open('empregados.txt', 'w', encoding='utf-8') as file:
-            for line in sample_data:
-                file.write(line + '\n')
-        print("✅ Arquivo empregados.txt criado com sucesso!")
-    except Exception as e:
-        print(f"❌ Erro ao criar arquivo: {e}")
-
 def main():
-    # Cria arquivo de exemplo se não existir
-    if not os.path.exists('empregados.txt'):
-        create_sample_file()
-    
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    window = SecureDB()
+    window = MainWindow()
     window.show()
     
     sys.exit(app.exec_())
