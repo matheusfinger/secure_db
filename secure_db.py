@@ -183,6 +183,9 @@ class Parser:
         columns = self.parse_select_columns()
         self._match('FROM')
         table = self._match('IDENTIFIER')
+
+        if table.value.lower() != 'empregados' and table.value.lower() != 'empregado':
+            raise Exception(table.value.lower())
         
         where_condition = None
         if self._peek() == 'WHERE':
